@@ -26,11 +26,14 @@ def generate_robot_nodes(context):
     robot_ip = LaunchConfiguration('robot_ip').perform(context)
     use_fake_hardware = LaunchConfiguration('use_fake_hardware').perform(context)
     robot_type = LaunchConfiguration('robot_type').perform(context)
+    arm_prefix = LaunchConfiguration('arm_prefix').perform(context)
     namespace = LaunchConfiguration('namespace').perform(context)
-    # Declare the launch argument names
+    # The names have to match the ones xacro put in the URDF, because joint_state_publisher
+    # merges this node's values into /joint_states by joint name and drops what it cannot match.
+    prefix = f'{arm_prefix}_' if arm_prefix else ''
     default_joint_name_postfix = '_finger_joint'
-    joint_names_1 = robot_type + default_joint_name_postfix + '1'
-    joint_names_2 = robot_type + default_joint_name_postfix + '2'
+    joint_names_1 = prefix + robot_type + default_joint_name_postfix + '1'
+    joint_names_2 = prefix + robot_type + default_joint_name_postfix + '2'
     joint_names = [joint_names_1, joint_names_2]
 
     nodes = []
@@ -82,6 +85,14 @@ def generate_launch_description():
                 description=(
                     'Name of the arm in the URDF file. This is used to generate the joint '
                     'names of the gripper.'
+                ),
+            ),
+            DeclareLaunchArgument(
+                'arm_prefix',
+                default_value='',
+                description=(
+                    'Prefix the URDF puts on the joint names, which the gripper joint names '
+                    'have to carry as well.'
                 ),
             ),
             DeclareLaunchArgument(

@@ -204,6 +204,8 @@ def generate_robot_nodes(context):
                 'namespace': namespace,
                 'robot_ip': LaunchConfiguration('robot_ip').perform(context),
                 'use_fake_hardware': LaunchConfiguration('use_fake_hardware').perform(context),
+                'robot_type': robot_type,
+                'arm_prefix': arm_prefix,
             }.items(),
             condition=IfCondition(LaunchConfiguration('load_gripper')),
         ),
