@@ -14,10 +14,10 @@ ROBOT1: # Arbitrary identifier for the first robot (a Mnemonic)
   fake_sensor_commands: "false" # Enable fake sensor commands for simulation
   joint_state_rate: 30 # Publishing rate for joint states (Hz)
   load_gripper: "true" # Enable Franka Gripper ("true" or "false")
-  namespace: "" # Namespace for robot, any string (empty string allowed - meaningful names recommended)
-  robot_ip: "localhost" # Robot’s IP address or hostname
+  namespace: "franko" # Namespace for robot, any string (empty string allowed - meaningful names recommended)
+  robot_ip: "129.70.143.6" # Robot’s IP address or hostname
   use_fake_hardware: "false" # Use simulated hardware ("true" or "false")
-  use_rviz: "true" # Launch RViz if "true" (single instance for all namespaces)
+  use_rviz: "false" # Launch RViz if "true" (single instance for all namespaces)
 # Uncomment the following lines to add more robots in Namespaces
 # ROBOT2:
 #   robot_type: ""
