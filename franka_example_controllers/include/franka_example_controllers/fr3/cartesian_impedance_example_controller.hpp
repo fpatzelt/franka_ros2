@@ -83,6 +83,8 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   Eigen::Matrix<double, num_joints, 1> dq_{Eigen::Matrix<double, num_joints, 1>::Zero()};
 
   double filter_params_{0.005};
+  /// Set from the ``filter_params`` parameter and re-readable at runtime; see onParameterUpdate.
+  realtime_tools::RealtimeBuffer<double> filter_params_buffer_;
 
   Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> cartesian_stiffness_;
   Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> cartesian_damping_;
@@ -138,7 +140,30 @@ class CartesianImpedanceExampleController : public controller_interface::Control
 
   /// @brief Builds stiffness and damping matrices from a 6-vector of stiffness values.
   /// @param k Stiffness values for each Cartesian DOF.
-  static CartesianGains buildGains(const std::array<double, num_cartesian_dof>& k);
+  /// Damping design. The vendor formula is `D = 2*sqrt(k)`, which is critical damping for a UNIT
+  /// mass; a real arm presents several kilograms of effective Cartesian inertia, so it runs at a
+  /// damping ratio near 0.4 -- underdamped at EVERY stiffness, since both the applied and the
+  /// required damping scale with sqrt(k). Observed as violent oscillation with nothing touching
+  /// the arm, worst with the arm extended sideways where the effective inertia is largest.
+  ///
+  /// `D = 2 * zeta * sqrt(k * m)` with m configurable per block, floored at the vendor value so
+  /// this can only ever ADD damping. Defaults leave rotation exactly as it was.
+  /// Rate, in 1/s, at which the nullspace target follows the arm. `q_d_nullspace_` is set
+  /// once in on_activate and never updated, so moving the tool across the bench builds a
+  /// joint error the controller pulls against -- and the nullspace projector is built from a
+  /// DAMPED pseudo-inverse, so a fraction of that pull leaks straight into the tool. It lands
+  /// mostly as orientation, because rotational stiffness is the weakest axis. Measured on
+  /// franko: 4.8 degrees of orientation error at a 98 mm excursion, 10.1 at 485 mm, growing
+  /// with distance because the joint error does.
+  ///
+  /// Letting the target follow keeps that error near zero at any position, so the leak has
+  /// nothing to scale with. 0.0 pins it as before, which is the A/B.
+  double nullspace_follow_rate_{1.0};
+  double damping_ratio_{1.0};
+  double translational_inertia_{6.0};
+  double rotational_inertia_{1.0};
+
+  CartesianGains buildGains(const std::array<double, num_cartesian_dof>& k) const;
 };
 
 }  // namespace franka_example_controllers

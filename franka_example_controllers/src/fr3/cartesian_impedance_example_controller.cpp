@@ -19,12 +19,19 @@
 namespace franka_example_controllers {
 
 CartesianImpedanceExampleController::CartesianGains CartesianImpedanceExampleController::buildGains(
-    const std::array<double, num_cartesian_dof>& k) {
+    const std::array<double, num_cartesian_dof>& k) const {
   CartesianGains g;
   for (int i = 0; i < num_cartesian_dof; ++i) {
     const double ki = std::max(0.0, k[i]);
     g.stiffness(i, i) = ki;
-    g.damping(i, i) = 2.0 * std::sqrt(ki);  // critically-damped
+
+    // Critical damping is 2*sqrt(k*m), not 2*sqrt(k): the latter is critical only for m = 1, and
+    // a real arm presents several kilograms of effective Cartesian inertia. The floor keeps this
+    // change one-directional -- it can add damping, never remove it -- so the worst case is the
+    // behaviour that shipped.
+    const double inertia = (i < 3) ? translational_inertia_ : rotational_inertia_;
+    g.damping(i, i) = std::max(2.0 * damping_ratio_ * std::sqrt(ki * std::max(0.0, inertia)),
+                               2.0 * std::sqrt(ki));
   }
   return g;
 }
@@ -34,8 +41,13 @@ CartesianImpedanceExampleController::CallbackReturn CartesianImpedanceExampleCon
     auto_declare<std::string>("arm_id", "fr3");
     auto_declare<std::string>("arm_prefix", "");
     auto_declare<double>("nullspace_stiffness", 20.0);
+    auto_declare<double>("filter_params", 0.005);
     auto_declare<double>("translational_stiffness", 150.0);
     auto_declare<double>("rotational_stiffness", 10.0);
+    auto_declare<double>("nullspace_follow_rate", 1.0);
+    auto_declare<double>("damping_ratio", 1.0);
+    auto_declare<double>("translational_inertia", 6.0);
+    auto_declare<double>("rotational_inertia", 1.0);
   } catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
@@ -93,6 +105,11 @@ CartesianImpedanceExampleController::on_configure(
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
       arm_id_ + "/" + k_robot_model_interface_name, arm_id_ + "/" + k_robot_state_interface_name);
 
+  nullspace_follow_rate_ = get_node()->get_parameter("nullspace_follow_rate").as_double();
+  damping_ratio_ = get_node()->get_parameter("damping_ratio").as_double();
+  translational_inertia_ = get_node()->get_parameter("translational_inertia").as_double();
+  rotational_inertia_ = get_node()->get_parameter("rotational_inertia").as_double();
+
   const double t_k = get_node()->get_parameter("translational_stiffness").as_double();
   const double r_k = get_node()->get_parameter("rotational_stiffness").as_double();
   const double n_k = get_node()->get_parameter("nullspace_stiffness").as_double();
@@ -103,6 +120,12 @@ CartesianImpedanceExampleController::on_configure(
   nullspace_stiffness_ = n_k;
   cartesian_gains_buffer_.initRT(gains);
   nullspace_stiffness_buffer_.initRT(n_k);
+
+  // One minus the pole of the first-order lag the target is filtered through, per control
+  // cycle: at 1 kHz, 0.005 is a 200 ms time constant and 0.02 is 50 ms. Larger tracks a
+  // streamed target more closely and passes more of its jitter through to the arm.
+  filter_params_ = get_node()->get_parameter("filter_params").as_double();
+  filter_params_buffer_.initRT(filter_params_);
 
   target_pose_buffer_.initRT(TargetPose{});
 
@@ -191,8 +214,9 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   transform.rotate(orientation.toRotationMatrix());
 
   const TargetPose target = *target_pose_buffer_.readFromRT();
-  updateMotionTarget(period.seconds(), target.orientation);
+  //updateMotionTarget(period.seconds(), target.orientation);
 
+  filter_params_ = *filter_params_buffer_.readFromRT();
   const CartesianGains target_gains = *cartesian_gains_buffer_.readFromRT();
   const double target_nullspace_stiffness = *nullspace_stiffness_buffer_.readFromRT();
 
@@ -227,6 +251,14 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
     if (!command_interfaces_[i].set_value(tau_d[i])) {
       return controller_interface::return_type::ERROR;
     }
+  }
+
+  // Let the nullspace target follow the arm, so the joint error it pulls against cannot grow
+  // with the excursion. Clamped to [0,1] so a large rate degenerates to "track exactly" rather
+  // than overshooting past the measurement and pulling the other way.
+  if (nullspace_follow_rate_ > 0.0) {
+    const double follow = std::min(1.0, std::max(0.0, nullspace_follow_rate_ * period.seconds()));
+    q_d_nullspace_ += follow * (q_ - q_d_nullspace_);
   }
 
   cartesian_stiffness_ =
@@ -331,6 +363,15 @@ rcl_interfaces::msg::SetParametersResult CartesianImpedanceExampleController::on
         return result;
       }
       nullspace_stiffness_buffer_.writeFromNonRT(v);
+    }
+    if (p.get_name() == "filter_params") {
+      const double v = p.as_double();
+      if (!std::isfinite(v) || v <= 0.0 || v > 1.0) {
+        result.successful = false;
+        result.reason = "filter_params must be finite and within (0, 1]";
+        return result;
+      }
+      filter_params_buffer_.writeFromNonRT(v);
     }
   }
   return result;
