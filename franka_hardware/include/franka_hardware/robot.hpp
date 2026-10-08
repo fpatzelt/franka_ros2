@@ -14,6 +14,9 @@
 
 #pragma once
 
+#include <pthread.h>
+#include <sched.h>
+
 #include <array>
 #include <atomic>
 #include <iostream>
@@ -43,6 +46,26 @@
 #include <rclcpp/logger.hpp>
 
 namespace franka_hardware {
+
+/// Records the calling thread's scheduling policy and priority and puts them back on destruction.
+class ScopedThreadScheduling {
+ public:
+  ScopedThreadScheduling()
+      : known_(pthread_getschedparam(pthread_self(), &policy_, &param_) == 0) {}
+  ScopedThreadScheduling(const ScopedThreadScheduling&) = delete;
+  ScopedThreadScheduling& operator=(const ScopedThreadScheduling&) = delete;
+
+  ~ScopedThreadScheduling() {
+    if (known_) {
+      pthread_setschedparam(pthread_self(), policy_, &param_);
+    }
+  }
+
+ private:
+  int policy_{};
+  sched_param param_{};
+  bool known_;
+};
 
 class Robot {
  public:

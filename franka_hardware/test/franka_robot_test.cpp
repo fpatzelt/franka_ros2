@@ -219,3 +219,16 @@ TEST_F(FrankaRobotTests,
   EXPECT_THROW(robot.writeOnce(cartesian_pose_vector), std::runtime_error);
   EXPECT_THROW(robot.writeOnce(cartesian_pose_vector, elbow_vector), std::runtime_error);
 }
+
+TEST(ScopedThreadSchedulingTests, givenPolicyChangedInsideScope_whenScopeEnds_thenPolicyIsPutBack) {
+  sched_param param{};
+  ASSERT_EQ(pthread_setschedparam(pthread_self(), SCHED_OTHER, &param), 0);
+  {
+    const franka_hardware::ScopedThreadScheduling keep_scheduling;
+    ASSERT_EQ(pthread_setschedparam(pthread_self(), SCHED_BATCH, &param), 0);
+  }
+
+  int policy = -1;
+  ASSERT_EQ(pthread_getschedparam(pthread_self(), &policy, &param), 0);
+  EXPECT_EQ(policy, SCHED_OTHER);
+}

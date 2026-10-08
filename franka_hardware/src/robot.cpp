@@ -44,7 +44,12 @@ Robot::Robot(const std::string& robot_ip, const rclcpp::Logger& logger) {
                 "https://frankarobotics.github.io/docs/"
                 "installation_linux.html#setting-up-the-real-time-kernel\n");
   }
-  robot_ = std::make_unique<franka::Robot>(robot_ip, rt_config);
+  {
+    // franka::Robot raises the thread that constructs it to the highest real-time priority. The
+    // guard puts this thread's scheduling back at the end of the block.
+    const ScopedThreadScheduling keep_scheduling;
+    robot_ = std::make_unique<franka::Robot>(robot_ip, rt_config);
+  }
   model_ = std::make_unique<franka::Model>(robot_->loadModel());
   franka_hardware_model_ = std::make_unique<Model>(model_.get());
 }
