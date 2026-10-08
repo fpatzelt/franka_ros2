@@ -26,7 +26,7 @@ CartesianImpedanceExampleController::CartesianGains CartesianImpedanceExampleCon
     g.stiffness(i, i) = ki;
 
     // 2 * zeta * sqrt(k * m) damps an inertia m with ratio zeta. The vendor's 2 * sqrt(k) is the
-    // case zeta = 1, m = 1, which the default rotational inertia reproduces.
+    // case zeta = 1, m = 1.
     const double inertia = (i < 3) ? translational_inertia_.load() : rotational_inertia_.load();
     g.damping(i, i) = 2.0 * damping_ratio_.load() * std::sqrt(ki * inertia);
   }
@@ -43,8 +43,8 @@ CartesianImpedanceExampleController::CallbackReturn CartesianImpedanceExampleCon
     auto_declare<double>("rotational_stiffness", 10.0);
     auto_declare<double>("nullspace_follow_rate", 1.0);
     auto_declare<double>("damping_ratio", 1.0);
-    auto_declare<double>("translational_inertia", 6.0);
-    auto_declare<double>("rotational_inertia", 1.0);
+    auto_declare<double>("translational_inertia", 3.0);
+    auto_declare<double>("rotational_inertia", 0.25);
     auto_declare<std::vector<double>>("friction_torque", std::vector<double>(num_joints, 0.0));
     auto_declare<double>("friction_compensation", 0.0);
     auto_declare<double>("friction_velocity_eps", 0.01);

@@ -147,27 +147,25 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   /// Damping design. The vendor formula is `D = 2*sqrt(k)`, which is critical damping for a UNIT
   /// mass; a real arm presents several kilograms of effective Cartesian inertia, so it runs at a
   /// damping ratio near 0.4 -- underdamped at EVERY stiffness, since both the applied and the
-  /// required damping scale with sqrt(k). Observed as violent oscillation with nothing touching
-  /// the arm, worst with the arm extended sideways where the effective inertia is largest.
+  /// required damping scale with sqrt(k).
   ///
-  /// `D = 2 * zeta * sqrt(k * m)` with zeta and m configurable per block. The defaults give
-  /// rotation the vendor's value; a rotational inertia below 1 gives it less. All three can be
-  /// set while the controller runs and take effect through the gains buffer.
-  /// Rate, in 1/s, at which the nullspace target follows the arm. `q_d_nullspace_` is set
-  /// once in on_activate and never updated, so moving the tool across the bench builds a
-  /// joint error the controller pulls against -- and the nullspace projector is built from a
-  /// DAMPED pseudo-inverse, so a fraction of that pull leaks straight into the tool. It lands
-  /// mostly as orientation, because rotational stiffness is the weakest axis. Measured on
-  /// franko: 4.8 degrees of orientation error at a 98 mm excursion, 10.1 at 485 mm, growing
-  /// with distance because the joint error does.
+  /// `D = 2 * zeta * sqrt(k * m)` with zeta and m configurable per block; zeta = 1 and m = 1
+  /// give the vendor's `2 * sqrt(k)`. All three can be set while the controller runs and take
+  /// effect through the gains buffer.
+  /// Rate, in 1/s, at which the nullspace target follows the arm. With the target pinned at
+  /// its activation value, moving the tool across the bench builds a joint error the
+  /// controller pulls against -- and the nullspace projector is built from a DAMPED
+  /// pseudo-inverse, so a fraction of that pull leaks straight into the tool. It lands mostly
+  /// as orientation, because rotational stiffness is the weakest axis, and grows with distance
+  /// because the joint error does.
   ///
   /// Letting the target follow keeps that error near zero at any position, so the leak has
-  /// nothing to scale with. 0.0 pins it as before, which is the A/B.
+  /// nothing to scale with. 0.0 pins the target at its activation value.
   double nullspace_follow_rate_{1.0};
   /// Written by the parameter callback and read by update() when inertia_shaping is on.
   std::atomic<double> damping_ratio_{1.0};
-  std::atomic<double> translational_inertia_{6.0};
-  std::atomic<double> rotational_inertia_{1.0};
+  std::atomic<double> translational_inertia_{3.0};
+  std::atomic<double> rotational_inertia_{0.25};
   /// The stiffness last asked for, which a change of the damping design is rebuilt against.
   /// Guarded by gains_mutex_, as is every write to the gains buffer that depends on it.
   std::array<double, num_cartesian_dof> stiffness_target_{};
