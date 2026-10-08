@@ -15,8 +15,11 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -116,7 +119,8 @@ class CartesianImpedanceExampleController : public controller_interface::Control
       const std::shared_ptr<franka_msgs::srv::SetCartesianStiffness::Request> request,
       std::shared_ptr<franka_msgs::srv::SetCartesianStiffness::Response> response);
 
-  /// @brief Callback for live parameter updates (nullspace_stiffness).
+  /// @brief Callback for live parameter updates: nullspace_stiffness, filter_params,
+  /// damping_ratio, translational_inertia and rotational_inertia.
   /// @param parameters List of updated parameters.
   rcl_interfaces::msg::SetParametersResult onParameterUpdate(
       const std::vector<rclcpp::Parameter>& parameters);
@@ -146,8 +150,9 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   /// required damping scale with sqrt(k). Observed as violent oscillation with nothing touching
   /// the arm, worst with the arm extended sideways where the effective inertia is largest.
   ///
-  /// `D = 2 * zeta * sqrt(k * m)` with m configurable per block, floored at the vendor value so
-  /// this can only ever ADD damping. Defaults leave rotation exactly as it was.
+  /// `D = 2 * zeta * sqrt(k * m)` with zeta and m configurable per block. The defaults give
+  /// rotation the vendor's value; a rotational inertia below 1 gives it less. All three can be
+  /// set while the controller runs and take effect through the gains buffer.
   /// Rate, in 1/s, at which the nullspace target follows the arm. `q_d_nullspace_` is set
   /// once in on_activate and never updated, so moving the tool across the bench builds a
   /// joint error the controller pulls against -- and the nullspace projector is built from a
@@ -159,9 +164,14 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   /// Letting the target follow keeps that error near zero at any position, so the leak has
   /// nothing to scale with. 0.0 pins it as before, which is the A/B.
   double nullspace_follow_rate_{1.0};
-  double damping_ratio_{1.0};
-  double translational_inertia_{6.0};
-  double rotational_inertia_{1.0};
+  /// Written by the parameter callback and read by update() when inertia_shaping is on.
+  std::atomic<double> damping_ratio_{1.0};
+  std::atomic<double> translational_inertia_{6.0};
+  std::atomic<double> rotational_inertia_{1.0};
+  /// The stiffness last asked for, which a change of the damping design is rebuilt against.
+  /// Guarded by gains_mutex_, as is every write to the gains buffer that depends on it.
+  std::array<double, num_cartesian_dof> stiffness_target_{};
+  std::mutex gains_mutex_;
 
   /// Per-joint Coulomb friction the arm is believed to have, in Nm, fed forward against the
   /// direction of motion. The impedance law has no integral action, so a static friction torque

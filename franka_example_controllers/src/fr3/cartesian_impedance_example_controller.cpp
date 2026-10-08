@@ -25,13 +25,10 @@ CartesianImpedanceExampleController::CartesianGains CartesianImpedanceExampleCon
     const double ki = std::max(0.0, k[i]);
     g.stiffness(i, i) = ki;
 
-    // Critical damping is 2*sqrt(k*m), not 2*sqrt(k): the latter is critical only for m = 1, and
-    // a real arm presents several kilograms of effective Cartesian inertia. The floor keeps this
-    // change one-directional -- it can add damping, never remove it -- so the worst case is the
-    // behaviour that shipped.
-    const double inertia = (i < 3) ? translational_inertia_ : rotational_inertia_;
-    g.damping(i, i) = std::max(2.0 * damping_ratio_ * std::sqrt(ki * std::max(0.0, inertia)),
-                               2.0 * std::sqrt(ki));
+    // 2 * zeta * sqrt(k * m) damps an inertia m with ratio zeta. The vendor's 2 * sqrt(k) is the
+    // case zeta = 1, m = 1, which the default rotational inertia reproduces.
+    const double inertia = (i < 3) ? translational_inertia_.load() : rotational_inertia_.load();
+    g.damping(i, i) = 2.0 * damping_ratio_.load() * std::sqrt(ki * inertia);
   }
   return g;
 }
@@ -117,6 +114,16 @@ CartesianImpedanceExampleController::on_configure(
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
       arm_id_ + "/" + k_robot_model_interface_name, arm_id_ + "/" + k_robot_state_interface_name);
 
+  // A zero would leave an axis undamped and a negative one makes the square root a NaN, so the
+  // controller refuses to configure on either.
+  for (const char* name : {"damping_ratio", "translational_inertia", "rotational_inertia"}) {
+    const double value = get_node()->get_parameter(name).as_double();
+    if (!std::isfinite(value) || value <= 0.0) {
+      RCLCPP_ERROR(get_node()->get_logger(), "%s must be finite and positive, got %f", name, value);
+      return CallbackReturn::ERROR;
+    }
+  }
+
   nullspace_follow_rate_ = get_node()->get_parameter("nullspace_follow_rate").as_double();
   damping_ratio_ = get_node()->get_parameter("damping_ratio").as_double();
   translational_inertia_ = get_node()->get_parameter("translational_inertia").as_double();
@@ -161,7 +168,12 @@ CartesianImpedanceExampleController::on_configure(
   const double r_k = get_node()->get_parameter("rotational_stiffness").as_double();
   const double n_k = get_node()->get_parameter("nullspace_stiffness").as_double();
 
-  CartesianGains gains = buildGains({t_k, t_k, t_k, r_k, r_k, r_k});
+  CartesianGains gains;
+  {
+    std::lock_guard<std::mutex> lock(gains_mutex_);
+    stiffness_target_ = {t_k, t_k, t_k, r_k, r_k, r_k};
+    gains = buildGains(stiffness_target_);
+  }
   cartesian_stiffness_ = gains.stiffness;
   cartesian_damping_ = gains.damping;
   nullspace_stiffness_ = n_k;
@@ -317,7 +329,7 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   if (inertia_shaping_ > 0.0) {
     Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> shape = shaping_inertia;
     for (int i = 0; i < num_cartesian_dof; i++) {
-      shape.col(i) /= (i < 3 ? translational_inertia_ : rotational_inertia_);
+      shape.col(i) /= (i < 3 ? translational_inertia_.load() : rotational_inertia_.load());
     }
     wrench = ((1.0 - inertia_shaping_) * identity_task + inertia_shaping_ * shape) * wrench;
     const double force = wrench.head<3>().norm();
@@ -442,7 +454,11 @@ void CartesianImpedanceExampleController::setCartesianStiffnessCallback(
     return;
   }
 
-  cartesian_gains_buffer_.writeFromNonRT(buildGains(k));
+  {
+    std::lock_guard<std::mutex> lock(gains_mutex_);
+    stiffness_target_ = k;
+    cartesian_gains_buffer_.writeFromNonRT(buildGains(k));
+  }
   response->success = true;
   response->error = "";
 }
@@ -452,25 +468,61 @@ rcl_interfaces::msg::SetParametersResult CartesianImpedanceExampleController::on
   rcl_interfaces::msg::SetParametersResult result;
   result.successful = true;
 
+  const auto designs_damping = [](const std::string& name) {
+    return name == "damping_ratio" || name == "translational_inertia" ||
+           name == "rotational_inertia";
+  };
+
+  // Every value is checked before any is applied, so a rejected request changes nothing.
   for (const auto& p : parameters) {
-    if (p.get_name() == "nullspace_stiffness") {
+    const std::string& name = p.get_name();
+    if (name == "nullspace_stiffness") {
       const double v = p.as_double();
       if (!std::isfinite(v) || v < 0.0) {
         result.successful = false;
         result.reason = "nullspace_stiffness must be finite and non-negative";
         return result;
       }
-      nullspace_stiffness_buffer_.writeFromNonRT(v);
-    }
-    if (p.get_name() == "filter_params") {
+    } else if (name == "filter_params") {
       const double v = p.as_double();
       if (!std::isfinite(v) || v <= 0.0 || v > 1.0) {
         result.successful = false;
         result.reason = "filter_params must be finite and within (0, 1]";
         return result;
       }
-      filter_params_buffer_.writeFromNonRT(v);
+    } else if (designs_damping(name)) {
+      const double v = p.as_double();
+      if (!std::isfinite(v) || v <= 0.0) {
+        result.successful = false;
+        result.reason = name + " must be finite and positive";
+        return result;
+      }
     }
+  }
+
+  bool damping_changed = false;
+  for (const auto& p : parameters) {
+    const std::string& name = p.get_name();
+    if (name == "nullspace_stiffness") {
+      nullspace_stiffness_buffer_.writeFromNonRT(p.as_double());
+    } else if (name == "filter_params") {
+      filter_params_buffer_.writeFromNonRT(p.as_double());
+    } else if (name == "damping_ratio") {
+      damping_ratio_ = p.as_double();
+      damping_changed = true;
+    } else if (name == "translational_inertia") {
+      translational_inertia_ = p.as_double();
+      damping_changed = true;
+    } else if (name == "rotational_inertia") {
+      rotational_inertia_ = p.as_double();
+      damping_changed = true;
+    }
+  }
+  // The damping is rebuilt for the stiffness in effect and reaches update() through the gains
+  // buffer, which blends it in at the rate of filter_params like a new stiffness.
+  if (damping_changed) {
+    std::lock_guard<std::mutex> lock(gains_mutex_);
+    cartesian_gains_buffer_.writeFromNonRT(buildGains(stiffness_target_));
   }
   return result;
 }
