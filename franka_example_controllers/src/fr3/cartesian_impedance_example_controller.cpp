@@ -48,6 +48,18 @@ CartesianImpedanceExampleController::CallbackReturn CartesianImpedanceExampleCon
     auto_declare<double>("damping_ratio", 1.0);
     auto_declare<double>("translational_inertia", 6.0);
     auto_declare<double>("rotational_inertia", 1.0);
+    auto_declare<std::vector<double>>("friction_torque", std::vector<double>(num_joints, 0.0));
+    auto_declare<double>("friction_compensation", 0.0);
+    auto_declare<double>("friction_velocity_eps", 0.01);
+    auto_declare<double>("integral_gain", 0.0);
+    auto_declare<double>("integral_limit", 30.0);
+    auto_declare<double>("integral_leak", 0.5);
+    auto_declare<double>("inertia_shaping", 0.0);
+    auto_declare<bool>("consistent_nullspace", false);
+    auto_declare<double>("task_inertia_damping", 0.01);
+    auto_declare<double>("shaping_damping", 0.2);
+    auto_declare<double>("shaping_force_limit", 60.0);
+    auto_declare<double>("shaping_moment_limit", 12.0);
   } catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
@@ -109,6 +121,41 @@ CartesianImpedanceExampleController::on_configure(
   damping_ratio_ = get_node()->get_parameter("damping_ratio").as_double();
   translational_inertia_ = get_node()->get_parameter("translational_inertia").as_double();
   rotational_inertia_ = get_node()->get_parameter("rotational_inertia").as_double();
+  friction_compensation_ = get_node()->get_parameter("friction_compensation").as_double();
+  friction_velocity_eps_ = get_node()->get_parameter("friction_velocity_eps").as_double();
+  integral_gain_ = get_node()->get_parameter("integral_gain").as_double();
+  integral_limit_ = get_node()->get_parameter("integral_limit").as_double();
+  integral_leak_ = get_node()->get_parameter("integral_leak").as_double();
+  inertia_shaping_ = get_node()->get_parameter("inertia_shaping").as_double();
+  consistent_nullspace_ = get_node()->get_parameter("consistent_nullspace").as_bool();
+  task_inertia_damping_ = get_node()->get_parameter("task_inertia_damping").as_double();
+  shaping_damping_ = get_node()->get_parameter("shaping_damping").as_double();
+  shaping_force_limit_ = get_node()->get_parameter("shaping_force_limit").as_double();
+  shaping_moment_limit_ = get_node()->get_parameter("shaping_moment_limit").as_double();
+
+  // Disabling one half asks for less clamping and delivers more torque: J^T w is
+  // J_v^T f + J_w^T m and the two partly cancel, so rescaling one half alone breaks the
+  // cancellation and raises peak joint torque above no clamp at all. Refused rather than
+  // half-applied, the same treatment a wrong-length friction_torque gets.
+  if (inertia_shaping_ > 0.0 &&
+      ((shaping_force_limit_ > 0.0) != (shaping_moment_limit_ > 0.0))) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "shaping_force_limit %.1f and shaping_moment_limit %.1f: clamping one half "
+                 "alone raises peak joint torque above no clamp at all; both disabled",
+                 shaping_force_limit_, shaping_moment_limit_);
+    shaping_force_limit_ = 0.0;
+    shaping_moment_limit_ = 0.0;
+  }
+
+  const auto friction = get_node()->get_parameter("friction_torque").as_double_array();
+  if (friction.size() == num_joints) {
+    std::copy(friction.begin(), friction.end(), friction_torque_.begin());
+  } else if (friction_compensation_ > 0.0) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "friction_torque needs %d values, got %zu; compensation disabled", num_joints,
+                 friction.size());
+    friction_compensation_ = 0.0;
+  }
 
   const double t_k = get_node()->get_parameter("translational_stiffness").as_double();
   const double r_k = get_node()->get_parameter("rotational_stiffness").as_double();
@@ -164,6 +211,7 @@ CartesianImpedanceExampleController::on_activate(
   elapsed_time_ = 0.0;
   orientation_d_ = orientation_init;
   q_d_nullspace_ = q_;
+  integral_error_.setZero();
 
   TargetPose initial_target;
   initial_target.position = position_init;
@@ -237,15 +285,65 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   }
   jacobian_transpose_pinv = svd.matrixV() * S.transpose() * svd.matrixU().transpose();
 
-  tau_task << jacobian.transpose() *
-                  (-cartesian_stiffness_ * error - cartesian_damping_ * (jacobian * dq_));
+  Eigen::Matrix<double, num_cartesian_dof, 1> wrench =
+      -cartesian_stiffness_ * error - cartesian_damping_ * (jacobian * dq_);
+  wrench += integralWrench(error, period.seconds());
 
-  tau_nullspace << (Eigen::Matrix<double, num_joints, num_joints>::Identity() -
-                    jacobian.transpose() * jacobian_transpose_pinv) *
-                       (nullspace_stiffness_ * (q_d_nullspace_ - q_) -
-                        2.0 * std::sqrt(nullspace_stiffness_) * dq_);
+  const auto identity_joints = Eigen::Matrix<double, num_joints, num_joints>::Identity();
+  const auto identity_task =
+      Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof>::Identity();
 
-  tau_d << tau_task + tau_nullspace + coriolis;
+  // The mass matrix is read only when a term needs it: both users invert a 6x6 built from it,
+  // which is not free at 1 kHz and is pure waste under the default configuration.
+  Eigen::Matrix<double, num_joints, num_cartesian_dof> mass_inverse_jacobian_transpose =
+      Eigen::Matrix<double, num_joints, num_cartesian_dof>::Zero();
+  Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> task_inertia = identity_task;
+  Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> shaping_inertia = identity_task;
+  if (inertia_shaping_ > 0.0 || consistent_nullspace_) {
+    std::array<double, num_joints * num_joints> mass_array = franka_robot_model_->getMassMatrix();
+    const Eigen::Map<Eigen::Matrix<double, num_joints, num_joints>> mass(mass_array.data());
+    mass_inverse_jacobian_transpose = mass.ldlt().solve(jacobian.transpose());
+    const Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> task_inverse =
+        jacobian * mass_inverse_jacobian_transpose;
+    task_inertia =
+        (task_inverse + task_inertia_damping_ * task_inertia_damping_ * identity_task).inverse();
+    shaping_inertia =
+        (task_inverse + shaping_damping_ * shaping_damping_ * identity_task).inverse();
+  }
+
+  // Premultiplying by Lambda Lambda_d^-1 cancels the arm's real task inertia and leaves the
+  // response the gains describe, identically everywhere in the workspace. Lambda_d is the
+  // notional inertia the damping is already built against, so a shaping of 0 is the identity.
+  if (inertia_shaping_ > 0.0) {
+    Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> shape = shaping_inertia;
+    for (int i = 0; i < num_cartesian_dof; i++) {
+      shape.col(i) /= (i < 3 ? translational_inertia_ : rotational_inertia_);
+    }
+    wrench = ((1.0 - inertia_shaping_) * identity_task + inertia_shaping_ * shape) * wrench;
+    const double force = wrench.head<3>().norm();
+    if (shaping_force_limit_ > 0.0 && force > shaping_force_limit_) {
+      wrench.head<3>() *= shaping_force_limit_ / force;
+    }
+    const double moment = wrench.tail<3>().norm();
+    if (shaping_moment_limit_ > 0.0 && moment > shaping_moment_limit_) {
+      wrench.tail<3>() *= shaping_moment_limit_ / moment;
+    }
+  }
+
+  tau_task << jacobian.transpose() * wrench;
+
+  const Eigen::Matrix<double, num_joints, 1> posture =
+      nullspace_stiffness_ * (q_d_nullspace_ - q_) - 2.0 * std::sqrt(nullspace_stiffness_) * dq_;
+  Eigen::Matrix<double, num_joints, num_joints> projector;
+  if (consistent_nullspace_) {
+    projector = identity_joints -
+                jacobian.transpose() * task_inertia * mass_inverse_jacobian_transpose.transpose();
+  } else {
+    projector = identity_joints - jacobian.transpose() * jacobian_transpose_pinv;
+  }
+  tau_nullspace << projector * posture;
+
+  tau_d << tau_task + tau_nullspace + coriolis + frictionFeedforward();
 
   for (int i = 0; i < num_joints; i++) {
     if (!command_interfaces_[i].set_value(tau_d[i])) {
@@ -375,6 +473,36 @@ rcl_interfaces::msg::SetParametersResult CartesianImpedanceExampleController::on
     }
   }
   return result;
+}
+
+Eigen::Matrix<double, CartesianImpedanceExampleController::num_joints, 1>
+CartesianImpedanceExampleController::frictionFeedforward() const {
+  Eigen::Matrix<double, num_joints, 1> tau_friction =
+      Eigen::Matrix<double, num_joints, 1>::Zero();
+  if (friction_compensation_ <= 0.0) {
+    return tau_friction;
+  }
+  for (int i = 0; i < num_joints; i++) {
+    tau_friction[i] = friction_compensation_ * friction_torque_[i] *
+                      std::tanh(dq_[i] / friction_velocity_eps_);
+  }
+  return tau_friction;
+}
+
+Eigen::Matrix<double, CartesianImpedanceExampleController::num_cartesian_dof, 1>
+CartesianImpedanceExampleController::integralWrench(
+    const Eigen::Matrix<double, num_cartesian_dof, 1>& error,
+    double dt) {
+  if (integral_gain_ <= 0.0) {
+    return Eigen::Matrix<double, num_cartesian_dof, 1>::Zero();
+  }
+  integral_error_ *= std::max(0.0, 1.0 - integral_leak_ * dt);
+  integral_error_ += error * dt;
+  // Clamped on the accumulated wrench rather than the integrated error, so the limit reads in
+  // newtons and does not move when the gain does.
+  const double limit = integral_limit_ / std::max(integral_gain_, 1e-9);
+  integral_error_ = integral_error_.cwiseMax(-limit).cwiseMin(limit);
+  return -integral_gain_ * integral_error_;
 }
 
 }  // namespace franka_example_controllers

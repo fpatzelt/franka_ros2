@@ -163,7 +163,61 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   double translational_inertia_{6.0};
   double rotational_inertia_{1.0};
 
+  /// Per-joint Coulomb friction the arm is believed to have, in Nm, fed forward against the
+  /// direction of motion. The impedance law has no integral action, so a static friction torque
+  /// stands as a permanent Cartesian offset that no gain change removes.
+  std::array<double, num_joints> friction_torque_{};
+  /// Fraction of `friction_torque_` to apply. Deliberately under unity: compensating a friction
+  /// over-estimate is negative damping at low speed, which is a limit cycle, not a stiffer arm.
+  double friction_compensation_{0.0};
+  /// Velocity scale, in rad/s, of the tanh that replaces sign(dq). A discrete controller
+  /// crossing a discontinuity at 1 kHz chatters; the taper costs a little compensation at a
+  /// standstill and removes that.
+  double friction_velocity_eps_{0.01};
+
+  /// Integral action on the Cartesian error, N/m per second. The pure impedance law is a
+  /// spring: any load it cannot overcome stands as a permanent offset of F/K. Nonzero gain is
+  /// the only term here that can remove one.
+  double integral_gain_{0.0};
+  /// Largest wrench the integrator may contribute, in N and Nm.
+  double integral_limit_{30.0};
+  /// Rate, in 1/s, at which the accumulator decays while an error is held. The task's long
+  /// stationary waits would otherwise charge it against contact and release it as a lurch.
+  double integral_leak_{0.5};
+  Eigen::Matrix<double, num_cartesian_dof, 1> integral_error_{
+      Eigen::Matrix<double, num_cartesian_dof, 1>::Zero()};
+
+  /// How far to cancel the arm's own task-space inertia, 0 for not at all and 1 for
+  /// full. `J^T(-K e - D v)` commands a force, so the acceleration it produces divides by
+  /// whatever the task inertia is in that posture -- which is why the same commanded step is
+  /// brisk near the base and sluggish at reach.
+  double inertia_shaping_{0.0};
+  /// Project the posture torque with `I - J^T Lambda J M^-1` instead of the damped inverse.
+  /// A projector built from a DAMPED pseudo-inverse is not a projector: the damping is
+  /// exactly what lets posture effort reach the tool.
+  bool consistent_nullspace_{false};
+  /// Damping in the inversion of `J M^-1 J^T` for the PROJECTOR. Every unit of it is leak the
+  /// projector exists to remove, so it is kept as small as conditioning allows.
+  double task_inertia_damping_{0.01};
+  /// Damping in the same inversion for the SHAPING term, which needs the opposite of what the
+  /// projector needs: it is the only bound on Lambda, which grows without limit as the arm
+  /// nears a singularity and multiplies the commanded wrench with it.
+  double shaping_damping_{0.2};
+  /// Largest shaped force, in N, SCALED to rather than clipped at; 0 disables it. Clipping
+  /// componentwise projects onto a box, which moves the wrench's direction: the shaped
+  /// components partly cancel through J^T, and breaking that cancellation raises the joint
+  /// torque the limit exists to hold down, the more the tighter the box.
+  double shaping_force_limit_{60.0};
+  /// Largest shaped moment, in Nm, scaled the same way. Separate from the force because they
+  /// are not comparable quantities and the wrist -- rated 12 Nm against the shoulder's 87 -- is
+  /// the axis this arm is weak on; a single limit loose enough for the force never binds here.
+  double shaping_moment_limit_{12.0};
+
   CartesianGains buildGains(const std::array<double, num_cartesian_dof>& k) const;
+  Eigen::Matrix<double, num_joints, 1> frictionFeedforward() const;
+  Eigen::Matrix<double, num_cartesian_dof, 1> integralWrench(
+      const Eigen::Matrix<double, num_cartesian_dof, 1>& error,
+      double dt);
 };
 
 }  // namespace franka_example_controllers
