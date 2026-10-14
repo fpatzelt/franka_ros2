@@ -14,6 +14,7 @@
 
 #include "franka_example_controllers/fr3/cartesian_impedance_example_controller.hpp"
 
+#include <algorithm>
 #include <cassert>
 
 namespace franka_example_controllers {
@@ -45,12 +46,17 @@ CartesianImpedanceExampleController::CallbackReturn CartesianImpedanceExampleCon
     auto_declare<double>("damping_ratio", 1.0);
     auto_declare<double>("translational_inertia", 3.0);
     auto_declare<double>("rotational_inertia", 0.25);
+    auto_declare<double>("velocity_feedforward", 0.0);
+    auto_declare<double>("acceleration_feedforward", 0.0);
+    auto_declare<bool>("interpolate_target", false);
+    auto_declare<std::vector<double>>("joint_torque_offset", std::vector<double>(num_joints, 0.0));
     auto_declare<std::vector<double>>("friction_torque", std::vector<double>(num_joints, 0.0));
-    auto_declare<double>("friction_compensation", 0.0);
-    auto_declare<double>("friction_velocity_eps", 0.01);
-    auto_declare<double>("integral_gain", 0.0);
-    auto_declare<double>("integral_limit", 30.0);
-    auto_declare<double>("integral_leak", 0.5);
+    for (const auto& [name, field] : k_friction_parameters_) {
+      auto_declare<double>(name, FrictionSettings{}.*field);
+    }
+    for (const auto& [name, field] : k_integral_parameters_) {
+      auto_declare<double>(name, IntegralSettings{}.*field);
+    }
     auto_declare<double>("inertia_shaping", 0.0);
     auto_declare<bool>("consistent_nullspace", false);
     auto_declare<double>("task_inertia_damping", 0.01);
@@ -124,15 +130,59 @@ CartesianImpedanceExampleController::on_configure(
     }
   }
 
+  for (const auto& [name, field] : k_integral_parameters_) {
+    const double value = get_node()->get_parameter(name).as_double();
+    if (!std::isfinite(value) || value < 0.0) {
+      RCLCPP_ERROR(get_node()->get_logger(), "%s must be finite and non-negative, got %f", name,
+                   value);
+      return CallbackReturn::ERROR;
+    }
+    integral_settings_.*field = value;
+  }
+  integral_buffer_.initRT(integral_settings_);
+
+  const double feedforward = get_node()->get_parameter("velocity_feedforward").as_double();
+  if (!std::isfinite(feedforward) || feedforward < 0.0 || feedforward > 1.0) {
+    RCLCPP_ERROR(get_node()->get_logger(), "velocity_feedforward must be within [0, 1], got %f",
+                 feedforward);
+    return CallbackReturn::ERROR;
+  }
+  velocity_feedforward_ = feedforward;
+
+  const double acceleration = get_node()->get_parameter("acceleration_feedforward").as_double();
+  if (!std::isfinite(acceleration) || acceleration < 0.0 || acceleration > 1.0) {
+    RCLCPP_ERROR(get_node()->get_logger(), "acceleration_feedforward must be within [0, 1], got %f",
+                 acceleration);
+    return CallbackReturn::ERROR;
+  }
+  acceleration_feedforward_ = acceleration;
+  interpolate_target_ = get_node()->get_parameter("interpolate_target").as_bool();
+
+  const auto offset = get_node()->get_parameter("joint_torque_offset").as_double_array();
+  std::array<double, num_joints> joint_torque_offset{};
+  if (!validJointTorqueOffset(offset)) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "joint_torque_offset needs %d finite values within +-%.1f Nm", num_joints,
+                 k_max_joint_torque_offset_);
+    return CallbackReturn::ERROR;
+  }
+  std::copy(offset.begin(), offset.end(), joint_torque_offset.begin());
+  joint_torque_offset_buffer_.initRT(joint_torque_offset);
+
+  for (const auto& [name, field] : k_friction_parameters_) {
+    friction_settings_.*field = get_node()->get_parameter(name).as_double();
+  }
+  if (!validFrictionSettings(friction_settings_)) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "friction settings: fractions must be non-negative and sum to at most 1, "
+                 "velocity scales positive");
+    return CallbackReturn::ERROR;
+  }
+
   nullspace_follow_rate_ = get_node()->get_parameter("nullspace_follow_rate").as_double();
   damping_ratio_ = get_node()->get_parameter("damping_ratio").as_double();
   translational_inertia_ = get_node()->get_parameter("translational_inertia").as_double();
   rotational_inertia_ = get_node()->get_parameter("rotational_inertia").as_double();
-  friction_compensation_ = get_node()->get_parameter("friction_compensation").as_double();
-  friction_velocity_eps_ = get_node()->get_parameter("friction_velocity_eps").as_double();
-  integral_gain_ = get_node()->get_parameter("integral_gain").as_double();
-  integral_limit_ = get_node()->get_parameter("integral_limit").as_double();
-  integral_leak_ = get_node()->get_parameter("integral_leak").as_double();
   inertia_shaping_ = get_node()->get_parameter("inertia_shaping").as_double();
   consistent_nullspace_ = get_node()->get_parameter("consistent_nullspace").as_bool();
   task_inertia_damping_ = get_node()->get_parameter("task_inertia_damping").as_double();
@@ -154,15 +204,26 @@ CartesianImpedanceExampleController::on_configure(
     shaping_moment_limit_ = 0.0;
   }
 
+  if (acceleration_feedforward_ > 0.0 &&
+      !(shaping_force_limit_ > 0.0 && shaping_moment_limit_ > 0.0)) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "acceleration_feedforward needs shaping_force_limit and shaping_moment_limit "
+                 "both positive");
+    return CallbackReturn::ERROR;
+  }
+
   const auto friction = get_node()->get_parameter("friction_torque").as_double_array();
   if (friction.size() == num_joints) {
     std::copy(friction.begin(), friction.end(), friction_torque_.begin());
-  } else if (friction_compensation_ > 0.0) {
+  } else if (friction_settings_.compensation > 0.0 ||
+             friction_settings_.target_compensation > 0.0) {
     RCLCPP_ERROR(get_node()->get_logger(),
                  "friction_torque needs %d values, got %zu; compensation disabled", num_joints,
                  friction.size());
-    friction_compensation_ = 0.0;
+    friction_settings_.compensation = 0.0;
+    friction_settings_.target_compensation = 0.0;
   }
+  friction_buffer_.initRT(friction_settings_);
 
   const double t_k = get_node()->get_parameter("translational_stiffness").as_double();
   const double r_k = get_node()->get_parameter("rotational_stiffness").as_double();
@@ -223,11 +284,21 @@ CartesianImpedanceExampleController::on_activate(
   elapsed_time_ = 0.0;
   orientation_d_ = orientation_init;
   q_d_nullspace_ = q_;
-  integral_error_.setZero();
+  integral_wrench_.setZero();
+  target_twist_.setZero();
+  target_twist_filtered_.setZero();
+  target_acceleration_.setZero();
+  reference_position_ = segment_start_position_ = segment_end_position_ = position_init;
+  reference_orientation_ = segment_start_orientation_ = segment_end_orientation_ = orientation_init;
+  segment_elapsed_ = arrival_interval_;
+  since_arrival_ = 1.0;
+  arrival_interval_measured_ = false;
 
   TargetPose initial_target;
   initial_target.position = position_init;
   initial_target.orientation = orientation_init;
+  initial_target.sequence = target_sequence_.load();
+  seen_sequence_ = initial_target.sequence;
   target_pose_buffer_.initRT(initial_target);
 
   return CallbackReturn::SUCCESS;
@@ -297,9 +368,14 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   }
   jacobian_transpose_pinv = svd.matrixV() * S.transpose() * svd.matrixU().transpose();
 
+  const Eigen::Matrix<double, num_cartesian_dof, 1> velocity = jacobian * dq_;
+  const bool interpolate = interpolate_target_.load();
+  const Eigen::Matrix<double, num_cartesian_dof, 1>& feedforward_twist =
+      interpolate ? target_twist_ : target_twist_filtered_;
   Eigen::Matrix<double, num_cartesian_dof, 1> wrench =
-      -cartesian_stiffness_ * error - cartesian_damping_ * (jacobian * dq_);
-  wrench += integralWrench(error, period.seconds());
+      -cartesian_stiffness_ * error -
+      cartesian_damping_ * (velocity - velocity_feedforward_.load() * feedforward_twist);
+  wrench += integralWrench(error, velocity, period.seconds());
 
   const auto identity_joints = Eigen::Matrix<double, num_joints, num_joints>::Identity();
   const auto identity_task =
@@ -311,7 +387,8 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
       Eigen::Matrix<double, num_joints, num_cartesian_dof>::Zero();
   Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> task_inertia = identity_task;
   Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> shaping_inertia = identity_task;
-  if (inertia_shaping_ > 0.0 || consistent_nullspace_) {
+  const double acceleration_feedforward = interpolate ? acceleration_feedforward_.load() : 0.0;
+  if (inertia_shaping_ > 0.0 || consistent_nullspace_ || acceleration_feedforward > 0.0) {
     std::array<double, num_joints * num_joints> mass_array = franka_robot_model_->getMassMatrix();
     const Eigen::Map<Eigen::Matrix<double, num_joints, num_joints>> mass(mass_array.data());
     mass_inverse_jacobian_transpose = mass.ldlt().solve(jacobian.transpose());
@@ -342,6 +419,20 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
     }
   }
 
+  if (acceleration_feedforward > 0.0) {
+    Eigen::Matrix<double, num_cartesian_dof, 1> inertial =
+        acceleration_feedforward * shaping_inertia * target_acceleration_;
+    const double force = inertial.head<3>().norm();
+    if (shaping_force_limit_ > 0.0 && force > shaping_force_limit_) {
+      inertial.head<3>() *= shaping_force_limit_ / force;
+    }
+    const double moment = inertial.tail<3>().norm();
+    if (shaping_moment_limit_ > 0.0 && moment > shaping_moment_limit_) {
+      inertial.tail<3>() *= shaping_moment_limit_ / moment;
+    }
+    wrench += inertial;
+  }
+
   tau_task << jacobian.transpose() * wrench;
 
   const Eigen::Matrix<double, num_joints, 1> posture =
@@ -355,7 +446,15 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   }
   tau_nullspace << projector * posture;
 
-  tau_d << tau_task + tau_nullspace + coriolis + frictionFeedforward();
+  // Damped least squares, J^T (J J^T + 1e-4 I)^-1, for the joint velocity the target asks for.
+  const Eigen::Matrix<double, num_joints, 1> target_joint_velocity =
+      jacobian.transpose() *
+      (jacobian * jacobian.transpose() + 1e-4 * identity_task).ldlt().solve(feedforward_twist);
+  const std::array<double, num_joints> joint_torque_offset =
+      *joint_torque_offset_buffer_.readFromRT();
+
+  tau_d << tau_task + tau_nullspace + coriolis + frictionFeedforward(target_joint_velocity) +
+               Eigen::Map<const Eigen::Matrix<double, num_joints, 1>>(joint_torque_offset.data());
 
   for (int i = 0; i < num_joints; i++) {
     if (!command_interfaces_[i].set_value(tau_d[i])) {
@@ -378,13 +477,31 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   nullspace_stiffness_ =
       filter_params_ * target_nullspace_stiffness + (1.0 - filter_params_) * nullspace_stiffness_;
 
-  position_d_ = filter_params_ * target.position + (1.0 - filter_params_) * position_d_;
-  // Keep the working orientation on the same hemisphere as the target before slerp.
-  if (orientation_d_.coeffs().dot(target.orientation.coeffs()) < 0.0) {
+  // The reference and the target filter move once per update, so their rates use the nominal
+  // cycle length, or the measured period when no update rate is set.
+  const double cycle = get_update_rate() > 0 ? 1.0 / get_update_rate() : period.seconds();
+  advanceReference(target, cycle);
+
+  const Eigen::Vector3d previous_position_d = position_d_;
+  const Eigen::Quaterniond previous_orientation_d = orientation_d_;
+  position_d_ = filter_params_ * reference_position_ + (1.0 - filter_params_) * position_d_;
+  // Keep the working orientation on the same hemisphere as the reference before slerp.
+  if (orientation_d_.coeffs().dot(reference_orientation_.coeffs()) < 0.0) {
     orientation_d_.coeffs() = -orientation_d_.coeffs();
   }
-  orientation_d_ = orientation_d_.slerp(filter_params_, target.orientation);
+  orientation_d_ = orientation_d_.slerp(filter_params_, reference_orientation_);
   orientation_d_.normalize();
+
+  if (cycle > 0.0) {
+    const Eigen::Matrix<double, num_cartesian_dof, 1> previous_twist = target_twist_;
+    target_twist_.head<3>() = (position_d_ - previous_position_d) / cycle;
+    const Eigen::AngleAxisd turn(orientation_d_ * previous_orientation_d.inverse());
+    target_twist_.tail<3>() = turn.angle() / cycle * turn.axis();
+    target_acceleration_ = filter_params_ * (target_twist_ - previous_twist) / cycle +
+                           (1.0 - filter_params_) * target_acceleration_;
+  }
+  target_twist_filtered_ =
+      filter_params_ * target_twist_ + (1.0 - filter_params_) * target_twist_filtered_;
 
   return controller_interface::return_type::OK;
 }
@@ -432,6 +549,7 @@ void CartesianImpedanceExampleController::equilibriumPoseCallback(
     return;
   }
   target.orientation.normalize();
+  target.sequence = ++target_sequence_;
 
   target_pose_buffer_.writeFromNonRT(target);
 }
@@ -472,6 +590,24 @@ rcl_interfaces::msg::SetParametersResult CartesianImpedanceExampleController::on
     return name == "damping_ratio" || name == "translational_inertia" ||
            name == "rotational_inertia";
   };
+  const auto friction_field = [](const std::string& name) -> double FrictionSettings::* {
+    for (const auto& [parameter, field] : k_friction_parameters_) {
+      if (name == parameter) {
+        return field;
+      }
+    }
+    return nullptr;
+  };
+  FrictionSettings friction = friction_settings_;
+  bool friction_changed = false;
+  const auto integral_field = [](const std::string& name) -> double IntegralSettings::* {
+    for (const auto& [parameter, field] : k_integral_parameters_) {
+      if (name == parameter) {
+        return field;
+      }
+    }
+    return nullptr;
+  };
 
   // Every value is checked before any is applied, so a rejected request changes nothing.
   for (const auto& p : parameters) {
@@ -497,10 +633,48 @@ rcl_interfaces::msg::SetParametersResult CartesianImpedanceExampleController::on
         result.reason = name + " must be finite and positive";
         return result;
       }
+    } else if (name == "velocity_feedforward" || name == "acceleration_feedforward") {
+      const double v = p.as_double();
+      if (!std::isfinite(v) || v < 0.0 || v > 1.0) {
+        result.successful = false;
+        result.reason = name + " must be within [0, 1]";
+        return result;
+      }
+      if (name == "acceleration_feedforward" && v > 0.0 &&
+          !(shaping_force_limit_ > 0.0 && shaping_moment_limit_ > 0.0)) {
+        result.successful = false;
+        result.reason =
+            "acceleration_feedforward needs shaping_force_limit and shaping_moment_limit positive";
+        return result;
+      }
+    } else if (name == "joint_torque_offset") {
+      if (!validJointTorqueOffset(p.as_double_array())) {
+        result.successful = false;
+        result.reason = "joint_torque_offset needs 7 finite values of at most 2 Nm";
+        return result;
+      }
+    } else if (const auto field = friction_field(name)) {
+      friction.*field = p.as_double();
+      friction_changed = true;
+    } else if (integral_field(name) != nullptr) {
+      const double v = p.as_double();
+      if (!std::isfinite(v) || v < 0.0) {
+        result.successful = false;
+        result.reason = name + " must be finite and non-negative";
+        return result;
+      }
     }
   }
 
+  if (friction_changed && !validFrictionSettings(friction)) {
+    result.successful = false;
+    result.reason =
+        "friction fractions must be non-negative and sum to at most 1, velocity scales positive";
+    return result;
+  }
+
   bool damping_changed = false;
+  bool integral_changed = false;
   for (const auto& p : parameters) {
     const std::string& name = p.get_name();
     if (name == "nullspace_stiffness") {
@@ -516,7 +690,28 @@ rcl_interfaces::msg::SetParametersResult CartesianImpedanceExampleController::on
     } else if (name == "rotational_inertia") {
       rotational_inertia_ = p.as_double();
       damping_changed = true;
+    } else if (name == "velocity_feedforward") {
+      velocity_feedforward_ = p.as_double();
+    } else if (name == "acceleration_feedforward") {
+      acceleration_feedforward_ = p.as_double();
+    } else if (name == "interpolate_target") {
+      interpolate_target_ = p.as_bool();
+    } else if (name == "joint_torque_offset") {
+      const auto values = p.as_double_array();
+      std::array<double, num_joints> offset{};
+      std::copy(values.begin(), values.end(), offset.begin());
+      joint_torque_offset_buffer_.writeFromNonRT(offset);
+    } else if (const auto field = integral_field(name)) {
+      integral_settings_.*field = p.as_double();
+      integral_changed = true;
     }
+  }
+  if (integral_changed) {
+    integral_buffer_.writeFromNonRT(integral_settings_);
+  }
+  if (friction_changed) {
+    friction_settings_ = friction;
+    friction_buffer_.writeFromNonRT(friction_settings_);
   }
   // The damping is rebuilt for the stiffness in effect and reaches update() through the gains
   // buffer, which blends it in at the rate of filter_params like a new stiffness.
@@ -528,33 +723,106 @@ rcl_interfaces::msg::SetParametersResult CartesianImpedanceExampleController::on
 }
 
 Eigen::Matrix<double, CartesianImpedanceExampleController::num_joints, 1>
-CartesianImpedanceExampleController::frictionFeedforward() const {
-  Eigen::Matrix<double, num_joints, 1> tau_friction =
-      Eigen::Matrix<double, num_joints, 1>::Zero();
-  if (friction_compensation_ <= 0.0) {
-    return tau_friction;
-  }
+CartesianImpedanceExampleController::frictionFeedforward(
+    const Eigen::Matrix<double, num_joints, 1>& target_joint_velocity) {
+  const FrictionSettings settings = *friction_buffer_.readFromRT();
+  Eigen::Matrix<double, num_joints, 1> tau_friction = Eigen::Matrix<double, num_joints, 1>::Zero();
   for (int i = 0; i < num_joints; i++) {
-    tau_friction[i] = friction_compensation_ * friction_torque_[i] *
-                      std::tanh(dq_[i] / friction_velocity_eps_);
+    tau_friction[i] = friction_torque_[i] *
+                      (settings.compensation * std::tanh(dq_[i] / settings.velocity_eps) +
+                       settings.target_compensation *
+                           std::tanh(target_joint_velocity[i] / settings.target_velocity_eps));
   }
   return tau_friction;
+}
+
+void CartesianImpedanceExampleController::advanceReference(const TargetPose& target, double dt) {
+  since_arrival_ += dt;
+  const bool arrived = target.sequence != seen_sequence_;
+  seen_sequence_ = target.sequence;
+  if (!interpolate_target_.load()) {
+    reference_position_ = segment_start_position_ = segment_end_position_ = target.position;
+    reference_orientation_ = segment_start_orientation_ = segment_end_orientation_ =
+        target.orientation;
+    segment_elapsed_ = arrival_interval_;
+    return;
+  }
+  if (arrived) {
+    if (since_arrival_ >= k_min_arrival_interval_ && since_arrival_ <= k_max_arrival_interval_) {
+      arrival_interval_ =
+          arrival_interval_measured_
+              ? arrival_interval_ + k_arrival_smoothing_ * (since_arrival_ - arrival_interval_)
+              : since_arrival_;
+      arrival_interval_measured_ = true;
+    }
+    since_arrival_ = 0.0;
+    segment_start_position_ = reference_position_;
+    segment_start_orientation_ = reference_orientation_;
+    segment_end_position_ = target.position;
+    segment_end_orientation_ = target.orientation;
+    segment_elapsed_ = 0.0;
+  }
+  segment_elapsed_ = std::min(segment_elapsed_ + dt, arrival_interval_);
+  const double fraction = segment_elapsed_ / arrival_interval_;
+  reference_position_ =
+      segment_start_position_ + fraction * (segment_end_position_ - segment_start_position_);
+  reference_orientation_ = segment_start_orientation_.slerp(fraction, segment_end_orientation_);
+}
+
+bool CartesianImpedanceExampleController::validJointTorqueOffset(
+    const std::vector<double>& offset) {
+  return offset.size() == num_joints && std::all_of(offset.begin(), offset.end(), [](double v) {
+           return std::isfinite(v) && std::abs(v) <= k_max_joint_torque_offset_;
+         });
+}
+
+bool CartesianImpedanceExampleController::validFrictionSettings(const FrictionSettings& settings) {
+  return std::isfinite(settings.compensation) && std::isfinite(settings.target_compensation) &&
+         settings.compensation >= 0.0 && settings.target_compensation >= 0.0 &&
+         settings.compensation + settings.target_compensation <= 1.0 &&
+         std::isfinite(settings.velocity_eps) && settings.velocity_eps > 0.0 &&
+         std::isfinite(settings.target_velocity_eps) && settings.target_velocity_eps > 0.0;
 }
 
 Eigen::Matrix<double, CartesianImpedanceExampleController::num_cartesian_dof, 1>
 CartesianImpedanceExampleController::integralWrench(
     const Eigen::Matrix<double, num_cartesian_dof, 1>& error,
+    const Eigen::Matrix<double, num_cartesian_dof, 1>& velocity,
     double dt) {
-  if (integral_gain_ <= 0.0) {
-    return Eigen::Matrix<double, num_cartesian_dof, 1>::Zero();
+  const IntegralSettings settings = *integral_buffer_.readFromRT();
+  if (settings.rate <= 0.0) {
+    integral_wrench_.setZero();
+    return integral_wrench_;
   }
-  integral_error_ *= std::max(0.0, 1.0 - integral_leak_ * dt);
-  integral_error_ += error * dt;
-  // Clamped on the accumulated wrench rather than the integrated error, so the limit reads in
-  // newtons and does not move when the gain does.
-  const double limit = integral_limit_ / std::max(integral_gain_, 1e-9);
-  integral_error_ = integral_error_.cwiseMax(-limit).cwiseMin(limit);
-  return -integral_gain_ * integral_error_;
+
+  const bool settled = target_twist_.head<3>().norm() < settings.max_speed &&
+                       target_twist_.tail<3>().norm() < settings.max_angular_speed &&
+                       velocity.head<3>().norm() < settings.max_speed &&
+                       velocity.tail<3>().norm() < settings.max_angular_speed;
+  if (settled) {
+    // The part of a vector that reaches beyond a ball of the given radius.
+    const auto beyond = [](const Eigen::Vector3d& v, double radius) -> Eigen::Vector3d {
+      const double norm = v.norm();
+      return norm > radius ? Eigen::Vector3d((1.0 - radius / norm) * v) : Eigen::Vector3d::Zero();
+    };
+    // The orientation error is the error quaternion's vector part, sin(angle / 2) long.
+    Eigen::Matrix<double, num_cartesian_dof, 1> outside;
+    outside << beyond(error.head<3>(), settings.position_deadband),
+        beyond(error.tail<3>(), std::sin(0.5 * settings.orientation_deadband));
+    integral_wrench_ -= settings.rate * dt * (cartesian_stiffness_ * outside);
+  } else {
+    integral_wrench_ *= std::max(0.0, 1.0 - settings.rate * dt);
+  }
+
+  const double force = integral_wrench_.head<3>().norm();
+  if (force > settings.force_limit) {
+    integral_wrench_.head<3>() *= settings.force_limit / force;
+  }
+  const double moment = integral_wrench_.tail<3>().norm();
+  if (moment > settings.moment_limit) {
+    integral_wrench_.tail<3>() *= settings.moment_limit / moment;
+  }
+  return integral_wrench_;
 }
 
 }  // namespace franka_example_controllers

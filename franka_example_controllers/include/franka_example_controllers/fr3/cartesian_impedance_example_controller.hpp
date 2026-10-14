@@ -18,9 +18,11 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -59,6 +61,8 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   struct TargetPose {
     Eigen::Vector3d position{Eigen::Vector3d::Zero()};
     Eigen::Quaterniond orientation{1.0, 0.0, 0.0, 0.0};
+    /// Counts the received targets, so update() can tell a new one from a repeated read.
+    std::uint64_t sequence{0};
   };
 
   static constexpr int num_joints{7};
@@ -120,7 +124,9 @@ class CartesianImpedanceExampleController : public controller_interface::Control
       std::shared_ptr<franka_msgs::srv::SetCartesianStiffness::Response> response);
 
   /// @brief Callback for live parameter updates: nullspace_stiffness, filter_params,
-  /// damping_ratio, translational_inertia and rotational_inertia.
+  /// damping_ratio, translational_inertia, rotational_inertia, velocity_feedforward,
+  /// acceleration_feedforward, interpolate_target, joint_torque_offset, the friction settings
+  /// and the integral_* parameters.
   /// @param parameters List of updated parameters.
   rcl_interfaces::msg::SetParametersResult onParameterUpdate(
       const std::vector<rclcpp::Parameter>& parameters);
@@ -171,29 +177,130 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   std::array<double, num_cartesian_dof> stiffness_target_{};
   std::mutex gains_mutex_;
 
-  /// Per-joint Coulomb friction the arm is believed to have, in Nm, fed forward against the
-  /// direction of motion. The impedance law has no integral action, so a static friction torque
-  /// stands as a permanent Cartesian offset that no gain change removes.
+  /// Per-joint Coulomb friction the arm is believed to have, in Nm, fed forward as the
+  /// FrictionSettings below describe.
   std::array<double, num_joints> friction_torque_{};
-  /// Fraction of `friction_torque_` to apply. Deliberately under unity: compensating a friction
-  /// over-estimate is negative damping at low speed, which is a limit cycle, not a stiffer arm.
-  double friction_compensation_{0.0};
-  /// Velocity scale, in rad/s, of the tanh that replaces sign(dq). A discrete controller
-  /// crossing a discontinuity at 1 kHz chatters; the taper costs a little compensation at a
-  /// standstill and removes that.
-  double friction_velocity_eps_{0.01};
+  /// How much of `friction_torque_` is fed forward, and along which velocity. All four are
+  /// settable at run time.
+  struct FrictionSettings {
+    /// Fraction applied along the measured joint velocity. Compensating a friction over-estimate
+    /// along the measured velocity is negative damping at low speed and drives a limit cycle.
+    double compensation{0.0};
+    /// Velocity scale, in rad/s, of the tanh that gives the compensation the sign of dq. Below
+    /// it the compensation tapers off, so it changes sign smoothly as dq crosses zero.
+    double velocity_eps{0.01};
+    /// Fraction applied along the joint velocity the moving target asks for, J^+ times the
+    /// feedforward twist. It does not depend on the measured motion, so it cannot feed back.
+    /// The two fractions together may not exceed 1.
+    double target_compensation{0.0};
+    /// Velocity scale, in rad/s, of the tanh on the target's joint velocity.
+    double target_velocity_eps{0.01};
+  };
+  static constexpr std::array<std::pair<const char*, double FrictionSettings::*>, 4>
+      k_friction_parameters_{{
+          {"friction_compensation", &FrictionSettings::compensation},
+          {"friction_velocity_eps", &FrictionSettings::velocity_eps},
+          {"friction_target_compensation", &FrictionSettings::target_compensation},
+          {"friction_target_velocity_eps", &FrictionSettings::target_velocity_eps},
+      }};
+  FrictionSettings friction_settings_;
+  realtime_tools::RealtimeBuffer<FrictionSettings> friction_buffer_;
 
-  /// Integral action on the Cartesian error, N/m per second. The pure impedance law is a
-  /// spring: any load it cannot overcome stands as a permanent offset of F/K. Nonzero gain is
-  /// the only term here that can remove one.
-  double integral_gain_{0.0};
-  /// Largest wrench the integrator may contribute, in N and Nm.
-  double integral_limit_{30.0};
-  /// Rate, in 1/s, at which the accumulator decays while an error is held. The task's long
-  /// stationary waits would otherwise charge it against contact and release it as a lurch.
-  double integral_leak_{0.5};
-  Eigen::Matrix<double, num_cartesian_dof, 1> integral_error_{
+  /// Constant torque per joint, in Nm, added to the command: the part of the arm's statics the
+  /// robot model does not predict. Settable at run time, at most k_max_joint_torque_offset_ per
+  /// joint.
+  realtime_tools::RealtimeBuffer<std::array<double, num_joints>> joint_torque_offset_buffer_;
+  static constexpr double k_max_joint_torque_offset_{2.0};
+
+  /// Integral action on the Cartesian error. It accumulates a wrench only while the filtered
+  /// target and the tool are both nearly still, and decays at the same rate while either moves.
+  struct IntegralSettings {
+    /// Gain as a fraction of the stiffness, per second: each settled cycle adds
+    /// `-rate * K * e * dt`, so a steady offset decays with a time constant of 1/rate.
+    /// 0 disables the term and empties the accumulator.
+    double rate{0.0};
+    /// Largest accumulated force, in N, and moment, in Nm. Each half is scaled down to its limit.
+    double force_limit{1.0};
+    double moment_limit{0.3};
+    /// Speeds, in m/s and rad/s. The accumulator integrates while the filtered target and the
+    /// tool both move slower than these, and decays otherwise.
+    double max_speed{0.01};
+    double max_angular_speed{0.05};
+    /// Position error in m and rotation angle in rad that is not integrated; only the part
+    /// beyond it is.
+    double position_deadband{0.0002};
+    double orientation_deadband{0.002};
+  };
+  /// Parameter name of every IntegralSettings field. Declared, validated and settable at run
+  /// time through this table.
+  static constexpr std::array<std::pair<const char*, double IntegralSettings::*>, 7>
+      k_integral_parameters_{{
+          {"integral_rate", &IntegralSettings::rate},
+          {"integral_force_limit", &IntegralSettings::force_limit},
+          {"integral_moment_limit", &IntegralSettings::moment_limit},
+          {"integral_max_speed", &IntegralSettings::max_speed},
+          {"integral_max_angular_speed", &IntegralSettings::max_angular_speed},
+          {"integral_position_deadband", &IntegralSettings::position_deadband},
+          {"integral_orientation_deadband", &IntegralSettings::orientation_deadband},
+      }};
+  /// Written by on_configure and the parameter callback, copied into the buffer after each
+  /// change.
+  IntegralSettings integral_settings_;
+  realtime_tools::RealtimeBuffer<IntegralSettings> integral_buffer_;
+  /// The accumulated wrench, base frame, force then moment.
+  Eigen::Matrix<double, num_cartesian_dof, 1> integral_wrench_{
       Eigen::Matrix<double, num_cartesian_dof, 1>::Zero()};
+  /// Velocity of the filtered target over the last cycle, base frame, linear then angular.
+  Eigen::Matrix<double, num_cartesian_dof, 1> target_twist_{
+      Eigen::Matrix<double, num_cartesian_dof, 1>::Zero()};
+  /// target_twist_ passed through a second first-order filter with the coefficient
+  /// filter_params, which smooths the steps a streamed target makes at its update rate.
+  Eigen::Matrix<double, num_cartesian_dof, 1> target_twist_filtered_{
+      Eigen::Matrix<double, num_cartesian_dof, 1>::Zero()};
+  /// Change of target_twist_ per second, base frame, passed through a first-order filter with
+  /// the coefficient filter_params.
+  Eigen::Matrix<double, num_cartesian_dof, 1> target_acceleration_{
+      Eigen::Matrix<double, num_cartesian_dof, 1>::Zero()};
+  /// Fraction of the feedforward twist the damping is measured against, from 0 to 1. At 0 the
+  /// damping acts on the tool's absolute velocity and the tool trails a moving target by D/K; at
+  /// 1 it acts on the velocity relative to the target and that trailing error is gone. The
+  /// feedforward twist is target_twist_ while the target is interpolated and
+  /// target_twist_filtered_ otherwise. Settable at run time.
+  std::atomic<double> velocity_feedforward_{0.0};
+  /// Fraction of the task inertia times target_acceleration_ added to the wrench, from 0 to 1:
+  /// the force the arm needs to follow the target's acceleration. It acts only while the target
+  /// is interpolated. The inertia is the one built with shaping_damping, and the result is scaled
+  /// to shaping_force_limit and shaping_moment_limit, which must both be positive for it.
+  /// Settable at run time.
+  std::atomic<double> acceleration_feedforward_{0.0};
+
+  /// When set, each received target is reached along a straight line, in position and by slerp
+  /// in orientation, over the mean interval at which targets arrive, starting from where the
+  /// reference is when it arrives. The target filter follows that reference; when unset, the
+  /// reference steps to each received target. Settable at run time.
+  std::atomic<bool> interpolate_target_{false};
+  /// Written by the subscription callback.
+  std::atomic<std::uint64_t> target_sequence_{0};
+  /// Sequence of the last target update() has seen.
+  std::uint64_t seen_sequence_{0};
+  /// The reference the target filter follows, and the segment it is moving along.
+  Eigen::Vector3d reference_position_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond reference_orientation_{1.0, 0.0, 0.0, 0.0};
+  Eigen::Vector3d segment_start_position_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond segment_start_orientation_{1.0, 0.0, 0.0, 0.0};
+  Eigen::Vector3d segment_end_position_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond segment_end_orientation_{1.0, 0.0, 0.0, 0.0};
+  double segment_elapsed_{0.0};
+  /// Mean interval between received targets, in s, and the time since the last one.
+  double arrival_interval_{0.02};
+  double since_arrival_{1.0};
+  /// Whether an interval has been measured since activation; the first one is taken as the mean.
+  bool arrival_interval_measured_{false};
+  /// Intervals outside this range, in s, do not update the mean; it moves by
+  /// k_arrival_smoothing_ of the difference per arrival.
+  static constexpr double k_min_arrival_interval_{0.005};
+  static constexpr double k_max_arrival_interval_{0.1};
+  static constexpr double k_arrival_smoothing_{0.1};
 
   /// How far to cancel the arm's own task-space inertia, 0 for not at all and 1 for
   /// full. `J^T(-K e - D v)` commands a force, so the acceleration it produces divides by
@@ -222,9 +329,27 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   double shaping_moment_limit_{12.0};
 
   CartesianGains buildGains(const std::array<double, num_cartesian_dof>& k) const;
-  Eigen::Matrix<double, num_joints, 1> frictionFeedforward() const;
+  /// @brief Friction torque fed forward per FrictionSettings.
+  /// @param target_joint_velocity Joint velocity the moving target asks for.
+  Eigen::Matrix<double, num_joints, 1> frictionFeedforward(
+      const Eigen::Matrix<double, num_joints, 1>& target_joint_velocity);
+  /// @brief Moves the reference the target filter follows: to the target, or one cycle along
+  /// the segment toward it when the target is interpolated.
+  /// @param target The latest received target.
+  /// @param dt Length of the cycle in seconds.
+  void advanceReference(const TargetPose& target, double dt);
+  /// @brief Whether a joint_torque_offset value has 7 finite entries within the limit.
+  static bool validJointTorqueOffset(const std::vector<double>& offset);
+  /// @brief Whether the friction fractions are non-negative and sum to at most 1, and both
+  /// velocity scales are positive.
+  static bool validFrictionSettings(const FrictionSettings& settings);
+  /// @brief Advances the integral accumulator by one cycle and returns its wrench.
+  /// @param error Pose error as computeError returns it.
+  /// @param velocity Tool twist in the base frame.
+  /// @param dt Length of the cycle in seconds.
   Eigen::Matrix<double, num_cartesian_dof, 1> integralWrench(
       const Eigen::Matrix<double, num_cartesian_dof, 1>& error,
+      const Eigen::Matrix<double, num_cartesian_dof, 1>& velocity,
       double dt);
 };
 
