@@ -148,27 +148,14 @@ class CartesianImpedanceExampleController : public controller_interface::Control
                                                            const Eigen::Quaterniond& orientation,
                                                            const Eigen::Affine3d& transform) const;
 
-  /// @brief Builds stiffness and damping matrices from a 6-vector of stiffness values.
-  /// @param k Stiffness values for each Cartesian DOF.
-  /// Damping design. The vendor formula is `D = 2*sqrt(k)`, which is critical damping for a UNIT
-  /// mass; a real arm presents several kilograms of effective Cartesian inertia, so it runs at a
-  /// damping ratio near 0.4 -- underdamped at EVERY stiffness, since both the applied and the
-  /// required damping scale with sqrt(k).
-  ///
-  /// `D = 2 * zeta * sqrt(k * m)` with zeta and m configurable per block; zeta = 1 and m = 1
-  /// give the vendor's `2 * sqrt(k)`. All three can be set while the controller runs and take
-  /// effect through the gains buffer.
-  /// Rate, in 1/s, at which the nullspace target follows the arm. With the target pinned at
-  /// its activation value, moving the tool across the bench builds a joint error the
-  /// controller pulls against -- and the nullspace projector is built from a DAMPED
-  /// pseudo-inverse, so a fraction of that pull leaks straight into the tool. It lands mostly
-  /// as orientation, because rotational stiffness is the weakest axis, and grows with distance
-  /// because the joint error does.
-  ///
-  /// Letting the target follow keeps that error near zero at any position, so the leak has
-  /// nothing to scale with. 0.0 pins the target at its activation value.
+  /// Rate, in 1/s, at which the nullspace target follows the measured joint positions: each
+  /// cycle it moves min(1, rate * dt) of the way to them, which keeps the joint error the
+  /// posture term pulls against small at any tool position. 0.0 pins the target at its
+  /// activation value.
   double nullspace_follow_rate_{1.0};
-  /// Written by the parameter callback and read by update() when inertia_shaping is on.
+  /// Damping ratio and the Cartesian inertias, in kg and kg m^2, that buildGains designs the
+  /// damping for. Written by the parameter callback; update() reads the inertias when
+  /// inertia_shaping is on.
   std::atomic<double> damping_ratio_{1.0};
   std::atomic<double> translational_inertia_{3.0};
   std::atomic<double> rotational_inertia_{0.25};
@@ -302,32 +289,37 @@ class CartesianImpedanceExampleController : public controller_interface::Control
   static constexpr double k_max_arrival_interval_{0.1};
   static constexpr double k_arrival_smoothing_{0.1};
 
-  /// How far to cancel the arm's own task-space inertia, 0 for not at all and 1 for
-  /// full. `J^T(-K e - D v)` commands a force, so the acceleration it produces divides by
-  /// whatever the task inertia is in that posture -- which is why the same commanded step is
-  /// brisk near the base and sluggish at reach.
+  /// How far to cancel the arm's own task-space inertia, from 0 (not at all) to 1 (fully). The
+  /// wrench is premultiplied by `(1 - s) I + s Lambda Lambda_d^-1`, with Lambda_d the diagonal of
+  /// translational_inertia_ and rotational_inertia_. At 1 a commanded wrench accelerates the
+  /// tool as it would accelerate Lambda_d, in every posture.
   double inertia_shaping_{0.0};
-  /// Project the posture torque with `I - J^T Lambda J M^-1` instead of the damped inverse.
-  /// A projector built from a DAMPED pseudo-inverse is not a projector: the damping is
-  /// exactly what lets posture effort reach the tool.
+  /// When set, the posture torque is projected with the dynamically consistent
+  /// `I - J^T Lambda J M^-1`; otherwise with `I - J^T (J^T)^+`, where (J^T)^+ is the damped
+  /// pseudo-inverse. The damped projector lets part of the posture torque reach the tool.
   bool consistent_nullspace_{false};
-  /// Damping in the inversion of `J M^-1 J^T` for the PROJECTOR. Every unit of it is leak the
-  /// projector exists to remove, so it is kept as small as conditioning allows.
+  /// Damping lambda in `Lambda = (J M^-1 J^T + lambda^2 I)^-1` for the consistent projector.
+  /// The larger it is, the more posture torque reaches the tool; the smaller, the worse the
+  /// inversion is conditioned near a singularity.
   double task_inertia_damping_{0.01};
-  /// Damping in the same inversion for the SHAPING term, which needs the opposite of what the
-  /// projector needs: it is the only bound on Lambda, which grows without limit as the arm
-  /// nears a singularity and multiplies the commanded wrench with it.
+  /// The same damping for the Lambda that inertia shaping and acceleration feedforward use. It
+  /// bounds Lambda near a singularity, where the undamped Lambda grows without limit and scales
+  /// the wrench with it.
   double shaping_damping_{0.2};
-  /// Largest shaped force, in N, SCALED to rather than clipped at; 0 disables it. Clipping
-  /// componentwise projects onto a box, which moves the wrench's direction: the shaped
-  /// components partly cancel through J^T, and breaking that cancellation raises the joint
-  /// torque the limit exists to hold down, the more the tighter the box.
+  /// Largest norm, in N, of the force part of the shaped wrench and of the acceleration
+  /// feedforward. A larger force is scaled down to it, keeping its direction. 0 disables it.
   double shaping_force_limit_{60.0};
-  /// Largest shaped moment, in Nm, scaled the same way. Separate from the force because they
-  /// are not comparable quantities and the wrist -- rated 12 Nm against the shoulder's 87 -- is
-  /// the axis this arm is weak on; a single limit loose enough for the force never binds here.
+  /// Largest norm, in Nm, of the moment part, scaled the same way. 0 disables it. While
+  /// inertia_shaping is on, on_configure sets both limits to 0 when only one of them is positive.
   double shaping_moment_limit_{12.0};
 
+  /// @brief Builds stiffness and damping matrices from a 6-vector of stiffness values.
+  /// @param k Stiffness values for each Cartesian DOF.
+  ///
+  /// The damping is `D = 2 * zeta * sqrt(k * m)`, which damps an inertia m with ratio zeta:
+  /// zeta is damping_ratio_, m is translational_inertia_ for the force block and
+  /// rotational_inertia_ for the moment block. All three can be set while the controller runs
+  /// and take effect through the gains buffer.
   CartesianGains buildGains(const std::array<double, num_cartesian_dof>& k) const;
   /// @brief Friction torque fed forward per FrictionSettings.
   /// @param target_joint_velocity Joint velocity the moving target asks for.

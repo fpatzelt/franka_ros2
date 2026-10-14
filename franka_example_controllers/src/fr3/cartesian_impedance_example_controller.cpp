@@ -26,8 +26,7 @@ CartesianImpedanceExampleController::CartesianGains CartesianImpedanceExampleCon
     const double ki = std::max(0.0, k[i]);
     g.stiffness(i, i) = ki;
 
-    // 2 * zeta * sqrt(k * m) damps an inertia m with ratio zeta. The vendor's 2 * sqrt(k) is the
-    // case zeta = 1, m = 1.
+    // 2 * zeta * sqrt(k * m) damps an inertia m with ratio zeta.
     const double inertia = (i < 3) ? translational_inertia_.load() : rotational_inertia_.load();
     g.damping(i, i) = 2.0 * damping_ratio_.load() * std::sqrt(ki * inertia);
   }
@@ -190,15 +189,14 @@ CartesianImpedanceExampleController::on_configure(
   shaping_force_limit_ = get_node()->get_parameter("shaping_force_limit").as_double();
   shaping_moment_limit_ = get_node()->get_parameter("shaping_moment_limit").as_double();
 
-  // Disabling one half asks for less clamping and delivers more torque: J^T w is
-  // J_v^T f + J_w^T m and the two partly cancel, so rescaling one half alone breaks the
-  // cancellation and raises peak joint torque above no clamp at all. Refused rather than
-  // half-applied, the same treatment a wrong-length friction_torque gets.
+  // With inertia shaping on and exactly one of the two shaping limits positive, both limits are
+  // set to 0, which disables them. J^T w = J_v^T f + J_w^T m, and the two terms partly cancel,
+  // so scaling one part of the wrench alone can raise the peak joint torque.
   if (inertia_shaping_ > 0.0 &&
       ((shaping_force_limit_ > 0.0) != (shaping_moment_limit_ > 0.0))) {
     RCLCPP_ERROR(get_node()->get_logger(),
-                 "shaping_force_limit %.1f and shaping_moment_limit %.1f: clamping one half "
-                 "alone raises peak joint torque above no clamp at all; both disabled",
+                 "shaping_force_limit %.1f and shaping_moment_limit %.1f: inertia_shaping needs "
+                 "both positive or both 0; both limits disabled",
                  shaping_force_limit_, shaping_moment_limit_);
     shaping_force_limit_ = 0.0;
     shaping_moment_limit_ = 0.0;
@@ -345,7 +343,6 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   transform.rotate(orientation.toRotationMatrix());
 
   const TargetPose target = *target_pose_buffer_.readFromRT();
-  //updateMotionTarget(period.seconds(), target.orientation);
 
   filter_params_ = *filter_params_buffer_.readFromRT();
   const CartesianGains target_gains = *cartesian_gains_buffer_.readFromRT();
@@ -381,8 +378,8 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   const auto identity_task =
       Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof>::Identity();
 
-  // The mass matrix is read only when a term needs it: both users invert a 6x6 built from it,
-  // which is not free at 1 kHz and is pure waste under the default configuration.
+  // The mass matrix is read, and the two 6x6 task inertias inverted, only when inertia shaping,
+  // the consistent nullspace or acceleration feedforward is on.
   Eigen::Matrix<double, num_joints, num_cartesian_dof> mass_inverse_jacobian_transpose =
       Eigen::Matrix<double, num_joints, num_cartesian_dof>::Zero();
   Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> task_inertia = identity_task;
@@ -400,9 +397,9 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
         (task_inverse + shaping_damping_ * shaping_damping_ * identity_task).inverse();
   }
 
-  // Premultiplying by Lambda Lambda_d^-1 cancels the arm's real task inertia and leaves the
-  // response the gains describe, identically everywhere in the workspace. Lambda_d is the
-  // notional inertia the damping is already built against, so a shaping of 0 is the identity.
+  // Premultiplying by Lambda Lambda_d^-1 replaces the arm's task inertia Lambda with Lambda_d,
+  // the inertia the damping is designed for, so the response is the one the gains describe in
+  // every posture. inertia_shaping blends from the identity at 0 to that product at 1.
   if (inertia_shaping_ > 0.0) {
     Eigen::Matrix<double, num_cartesian_dof, num_cartesian_dof> shape = shaping_inertia;
     for (int i = 0; i < num_cartesian_dof; i++) {
@@ -462,9 +459,8 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
     }
   }
 
-  // Let the nullspace target follow the arm, so the joint error it pulls against cannot grow
-  // with the excursion. Clamped to [0,1] so a large rate degenerates to "track exactly" rather
-  // than overshooting past the measurement and pulling the other way.
+  // Move the nullspace target toward the measured joint positions. The step fraction is clamped
+  // to [0, 1], so a rate of 1/dt or more sets the target to the measurement.
   if (nullspace_follow_rate_ > 0.0) {
     const double follow = std::min(1.0, std::max(0.0, nullspace_follow_rate_ * period.seconds()));
     q_d_nullspace_ += follow * (q_ - q_d_nullspace_);
